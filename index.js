@@ -4,8 +4,8 @@ const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch
 
 // Access environment variables
 const botToken = process.env.BOT_TOKEN;
-const sourceChannelId = process.env.SOURCE_CHANNEL_ID; // ID del canal como string
-const destinationGroupId = process.env.DESTINATION_GROUP_ID; // ID del grupo como string
+const sourceChannelId = process.env.SOURCE_CHANNEL_ID;
+const destinationGroupId = process.env.DESTINATION_GROUP_ID;
 const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL;
 const PORT = process.env.PORT || 3000;
 
@@ -15,6 +15,11 @@ const app = express();
 // Cola de mensajes para procesamiento secuencial
 const messageQueue = [];
 let isProcessing = false;
+
+// Cache de temas para evitar consultas repetidas
+let topicsCache = [];
+let lastCacheUpdate = 0;
+const CACHE_DURATION = 60000; // 1 minuto
 
 // Middleware para parsear JSON
 app.use(express.json());
@@ -93,6 +98,22 @@ bot.start((ctx) => {
   console.log('Bot started');
 });
 
+// Función para limpiar y normalizar nombres
+const cleanName = (name) => {
+  if (!name) return null;
+  
+  // Eliminar hashtags si existen
+  let cleaned = name.replace(/^#+/, '').trim();
+  
+  // Mantener solo letras, números, espacios y algunos caracteres especiales
+  cleaned = cleaned.replace(/[^a-zA-Z0-9\s\-_]/g, '').trim();
+  
+  // Reemplazar múltiples espacios por uno solo
+  cleaned = cleaned.replace(/\s+/g, ' ');
+  
+  return cleaned || null;
+};
+
 // Función para extraer nombre de archivos (antes del guion)
 const extractNameFromFilename = (filename) => {
   if (!filename) return null;
@@ -105,42 +126,52 @@ const extractNameFromFilename = (filename) => {
     const name = match[1].trim();
     console.log('Nombre extraído antes del guion:', name);
     
-    // Limpiar espacios y caracteres especiales, mantener solo letras, números y espacios
-    const cleanName = name.replace(/[^a-zA-Z0-9\s]/g, '').trim();
-    console.log('Nombre limpio:', cleanName);
+    // Limpiar el nombre (sin eliminar espacios)
+    const cleanNameResult = cleanName(name);
+    console.log('Nombre limpio:', cleanNameResult);
     
-    return cleanName || null;
+    return cleanNameResult;
   }
   
   return null;
 };
 
-// Función para extraer texto entre iconos (ejemplo: ♀️ Potato Godzilla ♀️)
+// Función para extraer texto entre iconos
 const extractTextBetweenIcons = (text) => {
   if (!text) return null;
   
   console.log('Extrayendo texto entre iconos:', text);
   
   // Buscar texto entre emojis/iconos
-  // Esta regex busca texto rodeado por caracteres especiales/emojis
   const emojiRegex = /[\u{1F300}-\u{1F9FF}]|[\u{2600}-\u{26FF}]/gu;
   const words = text.split(/\s+/);
   
   // Buscar patrones como: emoji texto emoji
   for (let i = 0; i < words.length - 2; i++) {
     if (emojiRegex.test(words[i]) && !emojiRegex.test(words[i+1]) && emojiRegex.test(words[i+2])) {
-      const name = words[i+1].replace(/[^a-zA-Z0-9\s]/g, '').trim();
+      const name = cleanName(words[i+1]);
       console.log('Texto entre iconos encontrado:', name);
-      return name || null;
+      return name;
     }
   }
   
   // Alternativa: buscar texto que esté entre dos grupos de emojis
   const match = text.match(/([\u{1F300}-\u{1F9FF}\u{2600}-\u{26FF}]+)\s*([^\u{1F300}-\u{1F9FF}\u{2600}-\u{26FF}]+)\s*([\u{1F300}-\u{1F9FF}\u{2600}-\u{26FF}]+)/u);
   if (match && match[2]) {
-    const name = match[2].replace(/[^a-zA-Z0-9\s]/g, '').trim();
+    const name = cleanName(match[2]);
     console.log('Texto entre iconos (alternativa):', name);
-    return name || null;
+    return name;
+  }
+  
+  // Si no encuentra entre iconos, buscar cualquier palabra significativa
+  const significantWords = words.filter(word => 
+    word.length > 2 && !emojiRegex.test(word) && !word.match(/^https?:\/\//)
+  );
+  
+  if (significantWords.length > 0) {
+    const name = cleanName(significantWords[0]);
+    console.log('Palabra significativa encontrada:', name);
+    return name;
   }
   
   return null;
@@ -226,7 +257,7 @@ const isForumGroup = async () => {
 // Function to create a new topic
 const createTopic = async (topicName) => {
   try {
-    console.log(`🆕 Creando tema: ${topicName}`);
+    console.log(`🆕 Creando tema: "${topicName}"`);
     
     const response = await fetch(`https://api.telegram.org/bot${botToken}/createForumTopic`, {
       method: 'POST',
@@ -241,7 +272,14 @@ const createTopic = async (topicName) => {
     console.log('📊 Respuesta creación tema:', data);
     
     if (data.ok) {
-      console.log(`✅ Tema creado: ${topicName} (ID: ${data.result.message_thread_id})`);
+      console.log(`✅ Tema creado: "${topicName}" (ID: ${data.result.message_thread_id})`);
+      
+      // Actualizar cache
+      topicsCache.push({
+        name: topicName,
+        message_thread_id: data.result.message_thread_id
+      });
+      
       return data.result.message_thread_id;
     } else {
       throw new Error(data.description);
@@ -252,9 +290,17 @@ const createTopic = async (topicName) => {
   }
 };
 
-// Function to get existing topics
-const getForumTopics = async () => {
+// Function to get existing topics with cache
+const getForumTopics = async (forceRefresh = false) => {
   try {
+    const now = Date.now();
+    
+    // Usar cache si está fresco
+    if (!forceRefresh && topicsCache.length > 0 && (now - lastCacheUpdate) < CACHE_DURATION) {
+      console.log('📚 Usando cache de temas');
+      return topicsCache;
+    }
+    
     console.log('🔍 Obteniendo temas existentes...');
     
     const response = await fetch(`https://api.telegram.org/bot${botToken}/getForumTopics`, {
@@ -270,39 +316,88 @@ const getForumTopics = async () => {
     const data = await response.json();
     
     if (data.ok) {
-      console.log(`✅ Temas encontrados: ${data.result.topics?.length || 0}`);
-      return data.result.topics || [];
+      topicsCache = data.result.topics || [];
+      lastCacheUpdate = now;
+      console.log(`✅ Temas encontrados: ${topicsCache.length}`);
+      return topicsCache;
     }
     
     console.log('❌ Error obteniendo temas:', data);
     return [];
   } catch (error) {
     console.error('❌ Error obteniendo temas:', error);
-    return [];
+    return topicsCache; // Devolver cache aunque esté viejo
   }
 };
 
-// Encontrar o crear tema
+// Función mejorada para buscar temas existentes
+const findExistingTopic = (topics, classificationName) => {
+  const cleanSearch = classificationName.toLowerCase().trim();
+  
+  console.log(`🔍 Buscando tema existente para: "${classificationName}"`);
+  console.log(`🔍 Nombre normalizado: "${cleanSearch}"`);
+  
+  // Estrategias de búsqueda de mayor a menor precisión
+  const searchStrategies = [
+    // 1. Coincidencia exacta (case insensitive)
+    topic => topic.name.toLowerCase().trim() === cleanSearch,
+    
+    // 2. Coincidencia que contenga el nombre completo
+    topic => topic.name.toLowerCase().trim().includes(cleanSearch),
+    
+    // 3. El nombre contiene parte del tema
+    topic => cleanSearch.includes(topic.name.toLowerCase().trim()),
+    
+    // 4. Coincidencia de palabras clave (para nombres similares)
+    topic => {
+      const topicWords = topic.name.toLowerCase().split(/\s+/);
+      const searchWords = cleanSearch.split(/\s+/);
+      return searchWords.some(word => topicWords.includes(word));
+    }
+  ];
+  
+  for (const strategy of searchStrategies) {
+    const foundTopic = topics.find(strategy);
+    if (foundTopic) {
+      console.log(`✅ Tema encontrado con estrategia: "${foundTopic.name}"`);
+      return foundTopic;
+    }
+  }
+  
+  console.log('❌ No se encontró tema existente');
+  return null;
+};
+
+// Encontrar o crear tema (CORREGIDO)
 const findOrCreateTopic = async (classificationName) => {
   try {
     const topics = await getForumTopics();
-    const cleanClassification = classificationName.replace(/[^a-zA-Z0-9\s]/g, '').trim().toLowerCase();
     
-    console.log(`🔍 Buscando tema: "${cleanClassification}"`);
+    console.log(`🔍 Buscando tema para: "${classificationName}"`);
+    console.log(`📚 Temas en cache: ${topics.length}`);
     
-    // Buscar tema existente (búsqueda flexible)
-    const existingTopic = topics.find(topic => {
-      const cleanTopicName = topic.name.toLowerCase();
-      return cleanTopicName.includes(cleanClassification) || 
-             cleanClassification.includes(cleanTopicName) ||
-             cleanTopicName === cleanClassification;
-    });
-
+    // Buscar tema existente
+    const existingTopic = findExistingTopic(topics, classificationName);
+    
     if (existingTopic) {
-      console.log(`✅ Tema existente encontrado: "${existingTopic.name}"`);
+      console.log(`✅ Usando tema existente: "${existingTopic.name}" (ID: ${existingTopic.message_thread_id})`);
       return existingTopic.message_thread_id;
     } else {
       console.log(`🆕 Creando nuevo tema: "${classificationName}"`);
+      
+      // Forzar actualización del cache antes de crear
+      await getForumTopics(true);
+      
+      // Verificar nuevamente por si acaso
+      const refreshedTopics = await getForumTopics();
+      const doubleCheckTopic = findExistingTopic(refreshedTopics, classificationName);
+      
+      if (doubleCheckTopic) {
+        console.log(`✅ Tema encontrado en verificación doble: "${doubleCheckTopic.name}"`);
+        return doubleCheckTopic.message_thread_id;
+      }
+      
+      // Crear nuevo tema
       return await createTopic(classificationName);
     }
   } catch (error) {
